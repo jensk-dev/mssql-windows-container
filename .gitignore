@@ -1,0 +1,21 @@
+# SQL Server media (downloaded during build)
+sql-media/
+temp-download/
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# VS Code
+.vscode/
+
+# IDE
+*.suo
+*.user
+.vs/
+
+# Build artifacts
+*.log
+
+docker-compose.yml

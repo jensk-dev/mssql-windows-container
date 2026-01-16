@@ -1,0 +1,304 @@
+name: Nightly Build - MSSQL 2022 Windows Container
+
+on:
+  schedule:
+    # Run at 3 AM UTC daily
+    - cron: '0 3 * * *'
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/mssql-server-windows-developer
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate build metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $date = Get-Date -Format "yyyyMMdd"
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+
+          # Generate tags
+          $tags = @(
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest",
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:2022"
+          )
+
+          # For non-main branch pushes, add branch tag
+          if ("${{ github.ref }}" -ne "refs/heads/main" -and "${{ github.event_name }}" -eq "push") {
+            $branch = "${{ github.ref_name }}" -replace '[^a-zA-Z0-9]', '-'
+            $tags += "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$branch"
+          }
+
+          $tagsString = $tags -join "`n"
+
+          # Output for GitHub Actions
+          echo "date=$date" >> $env:GITHUB_OUTPUT
+          echo "short_sha=$shortSha" >> $env:GITHUB_OUTPUT
+
+          # Handle multiline output
+          echo "tags<<EOF" >> $env:GITHUB_OUTPUT
+          echo $tagsString >> $env:GITHUB_OUTPUT
+          echo "EOF" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Build date: $date"
+          Write-Host "Tags to be applied:"
+          $tags | ForEach-Object { Write-Host "  - $_" }
+
+      - name: Download SQL Server 2022 media
+        shell: pwsh
+        run: |
+          Write-Host "Downloading SQL Server 2022 Developer Edition..."
+          & .\scripts\download-sqlserver.ps1 -OutputPath ".\sql-media" -TempPath ".\temp-download"
+
+      - name: Verify SQL Server media
+        shell: pwsh
+        run: |
+          $setupPath = Get-ChildItem -Path ".\sql-media" -Filter "setup.exe" -Recurse | Select-Object -First 1
+          if (-not $setupPath) {
+            Write-Error "setup.exe not found in sql-media directory"
+            exit 1
+          }
+          Write-Host "SQL Server media verified: $($setupPath.FullName)"
+
+          Write-Host ""
+          Write-Host "Media directory contents:"
+          Get-ChildItem -Path ".\sql-media" -Depth 1 | ForEach-Object {
+            Write-Host "  $($_.Name)"
+          }
+
+      - name: Compute SQL media checksum
+        id: checksum
+        shell: pwsh
+        run: |
+          # Load checksum function
+          . "${{ github.workspace }}\scripts\lib\Get-FolderChecksum.ps1"
+
+          $checksum = Get-FolderChecksum -Path ".\sql-media" -Algorithm SHA256
+          Write-Host "Computed checksum: $checksum"
+
+          $shortChecksum = $checksum.Substring(0, 8)
+          Write-Host "Short checksum: $shortChecksum"
+
+          echo "hash=$checksum" >> $env:GITHUB_OUTPUT
+          echo "short_hash=$shortChecksum" >> $env:GITHUB_OUTPUT
+          echo "tag_name=sql-media-checksum/$shortChecksum" >> $env:GITHUB_OUTPUT
+
+      - name: Check for existing checksum tag
+        id: tag_check
+        shell: pwsh
+        run: |
+          $tagName = "${{ steps.checksum.outputs.tag_name }}"
+          Write-Host "Looking for tag: $tagName"
+
+          # Fetch tags from remote
+          git fetch --tags --quiet 2>$null
+
+          # Check if exact tag exists
+          $tagExists = git tag -l $tagName
+
+          if ($tagExists) {
+            Write-Host "Tag already exists: $tagName"
+            Write-Host "SQL media has not changed - build can be skipped"
+            echo "exists=true" >> $env:GITHUB_OUTPUT
+            echo "skip_build=true" >> $env:GITHUB_OUTPUT
+          }
+          else {
+            Write-Host "Tag does not exist: $tagName"
+            Write-Host "SQL media has changed or this is the first run - build required"
+            echo "exists=false" >> $env:GITHUB_OUTPUT
+            echo "skip_build=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Log in to Container Registry
+        if: steps.tag_check.outputs.skip_build != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker image
+        if: steps.tag_check.outputs.skip_build != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Building Docker image..."
+
+          $tags = @"
+          ${{ steps.meta.outputs.tags }}
+          "@
+
+          # Build with first tag
+          $primaryTag = ($tags -split "`n" | Select-Object -First 1).Trim()
+          Write-Host "Primary tag: $primaryTag"
+
+          docker build -t $primaryTag .
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Docker build failed"
+            exit 1
+          }
+
+          # Apply additional tags
+          $tags -split "`n" | Select-Object -Skip 1 | ForEach-Object {
+            $tag = $_.Trim()
+            if ($tag) {
+              Write-Host "Applying additional tag: $tag"
+              docker tag $primaryTag $tag
+            }
+          }
+
+          Write-Host "Docker build completed successfully"
+
+      - name: Push Docker image
+        if: steps.tag_check.outputs.skip_build != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Pushing Docker images to registry..."
+
+          $tags = @"
+          ${{ steps.meta.outputs.tags }}
+          "@
+
+          $tags -split "`n" | ForEach-Object {
+            $tag = $_.Trim()
+            if ($tag) {
+              Write-Host "Pushing: $tag"
+              docker push $tag
+
+              if ($LASTEXITCODE -ne 0) {
+                Write-Error "Failed to push: $tag"
+                exit 1
+              }
+            }
+          }
+
+          Write-Host "All images pushed successfully"
+
+      - name: Create checksum tag
+        if: steps.tag_check.outputs.skip_build != 'true'
+        shell: pwsh
+        run: |
+          $tagName = "${{ steps.checksum.outputs.tag_name }}"
+          $fullHash = "${{ steps.checksum.outputs.hash }}"
+
+          Write-Host "Creating tag: $tagName"
+
+          # Configure git for tagging
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Create annotated tag with full hash in message
+          git tag -a $tagName -m "SQL media checksum: $fullHash"
+
+          # Push the tag
+          git push origin $tagName
+
+          Write-Host "Tag created and pushed successfully: $tagName"
+
+      - name: Report build skipped
+        if: steps.tag_check.outputs.skip_build == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "=============================================="
+          Write-Host "BUILD SKIPPED - SQL Media unchanged"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "Checksum: ${{ steps.checksum.outputs.hash }}"
+          Write-Host "Tag: ${{ steps.checksum.outputs.tag_name }}"
+          Write-Host ""
+          Write-Host "The SQL Server media has not changed since the last build."
+          Write-Host "Docker image build and push were skipped to save resources."
+
+      - name: Generate build summary
+        shell: pwsh
+        run: |
+          $skipped = "${{ steps.tag_check.outputs.skip_build }}" -eq "true"
+
+          if ($skipped) {
+            $summary = @"
+          ## MSSQL 2022 Windows Container Build Summary
+
+          **Build Date:** ${{ steps.meta.outputs.date }}
+          **Commit:** ${{ github.sha }}
+          **Trigger:** ${{ github.event_name }}
+          **Status:** :fast_forward: SKIPPED (SQL media unchanged)
+
+          ### SQL Media Checksum
+          - **Checksum:** ``${{ steps.checksum.outputs.hash }}``
+          - **Tag:** ``${{ steps.checksum.outputs.tag_name }}``
+
+          The SQL Server media files have not changed since the last successful build.
+          Docker image build and push were skipped.
+          "@
+          }
+          else {
+            $summary = @"
+          ## MSSQL 2022 Windows Container Build Summary
+
+          **Build Date:** ${{ steps.meta.outputs.date }}
+          **Commit:** ${{ github.sha }}
+          **Trigger:** ${{ github.event_name }}
+          **Status:** :white_check_mark: SUCCESS
+
+          ### SQL Media Checksum
+          - **Checksum:** ``${{ steps.checksum.outputs.hash }}``
+          - **Tag:** ``${{ steps.checksum.outputs.tag_name }}``
+
+          ### Published Images
+
+          ``````
+          ${{ steps.meta.outputs.tags }}
+          ``````
+
+          ### Usage
+
+          ``````powershell
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+          docker run -d ``
+            -e ACCEPT_EULA=Y ``
+            -e SA_PASSWORD=YourStrong!Password123 ``
+            -p 1433:1433 ``
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          ``````
+
+          ### Verify Connection
+
+          ``````powershell
+          sqlcmd -S localhost -U sa -P YourStrong!Password123 -Q "SELECT @@VERSION"
+          ``````
+          "@
+          }
+
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "Cleaning up..."
+
+          # Remove SQL media (already deleted during build, but ensure cleanup)
+          if (Test-Path ".\sql-media") {
+            Remove-Item -Path ".\sql-media" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          if (Test-Path ".\temp-download") {
+            Remove-Item -Path ".\temp-download" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Cleanup completed"
