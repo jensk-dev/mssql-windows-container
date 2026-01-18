@@ -24,7 +24,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install containerd
+      - name: Install and start containerd
         shell: pwsh
         run: |
           Write-Host "Installing containerd..."
@@ -49,13 +49,35 @@ jobs:
           # Create default config
           & "$containerdPath\containerd.exe" config default | Out-File "$containerdPath\config.toml" -Encoding ascii
 
-          # Start containerd as a background process
-          Write-Host "Starting containerd..."
-          Start-Process -FilePath "$containerdPath\containerd.exe" -ArgumentList "--config", "$containerdPath\config.toml" -WindowStyle Hidden
+          # Register and start containerd as a Windows service
+          Write-Host "Registering containerd as a Windows service..."
+          & "$containerdPath\containerd.exe" --register-service --config "$containerdPath\config.toml"
+          Start-Service containerd
 
-          # Wait for containerd to be ready
-          Start-Sleep -Seconds 5
-          Write-Host "containerd installed and started"
+          # Wait for containerd pipe to be ready
+          Write-Host "Waiting for containerd to be ready..."
+          $pipePath = "\\.\pipe\containerd-containerd"
+          $maxAttempts = 30
+          $attempt = 0
+          while ($attempt -lt $maxAttempts) {
+            Start-Sleep -Seconds 2
+            $attempt++
+            $pipeExists = Test-Path $pipePath
+            if ($pipeExists) {
+              Write-Host "containerd is ready! (pipe exists: $pipePath)"
+              break
+            }
+            Write-Host "Attempt $attempt/$maxAttempts - Waiting for containerd pipe..."
+          }
+
+          if (-not (Test-Path $pipePath)) {
+            Write-Host "containerd service status:"
+            Get-Service containerd | Format-List *
+            Write-Error "containerd failed to start - pipe not found at $pipePath"
+            exit 1
+          }
+
+          Write-Host "containerd installed and running"
 
       - name: Install BuildKit
         shell: pwsh
