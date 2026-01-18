@@ -197,6 +197,34 @@ jobs:
             exit 1
           }
 
+      - name: Install Docker Buildx plugin
+        shell: pwsh
+        run: |
+          Write-Host "Installing Docker Buildx plugin..."
+
+          # Get latest buildx version
+          $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/docker/buildx/releases/latest" -UseBasicParsing
+          $version = $releases.tag_name
+          Write-Host "Latest buildx version: $version"
+
+          # Download buildx binary for Windows
+          $downloadUrl = "https://github.com/docker/buildx/releases/download/$version/buildx-$version.windows-amd64.exe"
+          Write-Host "Downloading from: $downloadUrl"
+          curl.exe -fSLO $downloadUrl
+
+          # Create Docker CLI plugins directory
+          $pluginsDir = "$env:USERPROFILE\.docker\cli-plugins"
+          New-Item -Path $pluginsDir -ItemType Directory -Force | Out-Null
+
+          # Install buildx plugin
+          Move-Item -Path "buildx-$version.windows-amd64.exe" -Destination "$pluginsDir\docker-buildx.exe" -Force
+
+          # Verify installation
+          Write-Host "Verifying buildx installation..."
+          docker buildx version
+
+          Write-Host "Docker Buildx plugin installed successfully"
+
       - name: Set up Docker Buildx with native BuildKit
         shell: pwsh
         run: |
