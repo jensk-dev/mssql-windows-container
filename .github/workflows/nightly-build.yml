@@ -155,21 +155,27 @@ jobs:
       - name: Start BuildKit daemon
         shell: pwsh
         run: |
-          Write-Host "Starting BuildKit daemon..."
+          Write-Host "Starting BuildKit daemon as Windows service..."
 
           $buildkitPath = "$env:ProgramFiles\buildkit"
           $cniConfPath = "$env:ProgramFiles\containerd\cni\conf\0-containerd-nat.conf"
           $cniBinDir = "$env:ProgramFiles\containerd\cni\bin"
 
-          # Start buildkitd with CNI configuration and explicit address
-          $buildkitdArgs = @(
-            "--addr", "npipe:////./pipe/buildkitd",
-            "--containerd-cni-config-path=$cniConfPath",
-            "--containerd-cni-binary-dir=$cniBinDir"
-          )
+          # Register buildkitd as a Windows service
+          Write-Host "Registering buildkitd as a Windows service..."
+          & "$buildkitPath\buildkitd.exe" --register-service `
+            --addr "npipe:////./pipe/buildkitd" `
+            --containerd-cni-config-path="$cniConfPath" `
+            --containerd-cni-binary-dir="$cniBinDir"
 
-          Write-Host "Starting buildkitd with args: $($buildkitdArgs -join ' ')"
-          Start-Process -FilePath "$buildkitPath\buildkitd.exe" -ArgumentList $buildkitdArgs -WindowStyle Hidden -RedirectStandardOutput "buildkitd.log" -RedirectStandardError "buildkitd.err"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to register buildkitd service"
+            exit 1
+          }
+
+          # Start the buildkitd service
+          Write-Host "Starting buildkitd service..."
+          Start-Service buildkitd
 
           # Wait for buildkitd to be ready
           Write-Host "Waiting for BuildKit to be ready..."
@@ -198,14 +204,13 @@ jobs:
           }
 
           if ($attempt -eq $maxAttempts) {
-            Write-Host "BuildKit daemon logs:"
-            if (Test-Path "buildkitd.log") { Get-Content "buildkitd.log" }
-            if (Test-Path "buildkitd.err") { Get-Content "buildkitd.err" }
+            Write-Host "BuildKit service status:"
+            Get-Service buildkitd | Format-List *
             Write-Error "BuildKit failed to start"
             exit 1
           }
 
-          Write-Host "BuildKit daemon started successfully on npipe:////./pipe/buildkitd"
+          Write-Host "BuildKit daemon running as service on npipe:////./pipe/buildkitd"
 
       - name: Install Docker Buildx plugin
         shell: pwsh
@@ -240,65 +245,38 @@ jobs:
         run: |
           Write-Host "Creating buildx builder with native BuildKit..."
 
-          # Check if buildkitd is still running
-          $buildkitdProcess = Get-Process -Name "buildkitd" -ErrorAction SilentlyContinue
-          if ($buildkitdProcess) {
-            Write-Host "buildkitd process is running (PID: $($buildkitdProcess.Id))"
+          # Check buildkitd service status
+          $service = Get-Service -Name "buildkitd" -ErrorAction SilentlyContinue
+          if ($service) {
+            Write-Host "buildkitd service status: $($service.Status)"
+            if ($service.Status -ne "Running") {
+              Write-Host "Restarting buildkitd service..."
+              Start-Service buildkitd
+              Start-Sleep -Seconds 5
+            }
           } else {
-            Write-Host "WARNING: buildkitd process not found!"
-            Write-Host "Checking buildkitd logs..."
-            if (Test-Path "buildkitd.log") {
-              Write-Host "=== buildkitd.log ==="
-              Get-Content "buildkitd.log"
-            }
-            if (Test-Path "buildkitd.err") {
-              Write-Host "=== buildkitd.err ==="
-              Get-Content "buildkitd.err"
-            }
+            Write-Error "buildkitd service not found!"
+            exit 1
           }
-
-          # List all named pipes to debug
-          Write-Host "Listing buildkit-related pipes..."
-          Get-ChildItem //./pipe/ | Where-Object { $_.Name -like "*buildkit*" -or $_.Name -like "*containerd*" } | ForEach-Object { Write-Host "  Pipe: $($_.Name)" }
 
           # Verify buildkitd pipe is accessible
           $pipePath = "\\.\pipe\buildkitd"
-          if (-not (Test-Path $pipePath)) {
-            Write-Host "BuildKit pipe not found at $pipePath"
-            Write-Host "Attempting to restart buildkitd..."
-
-            $buildkitPath = "$env:ProgramFiles\buildkit"
-            $cniConfPath = "$env:ProgramFiles\containerd\cni\conf\0-containerd-nat.conf"
-            $cniBinDir = "$env:ProgramFiles\containerd\cni\bin"
-
-            # Kill any existing buildkitd
-            Stop-Process -Name "buildkitd" -Force -ErrorAction SilentlyContinue
-
-            # Restart buildkitd
-            $buildkitdArgs = @(
-              "--addr", "npipe:////./pipe/buildkitd",
-              "--containerd-cni-config-path=$cniConfPath",
-              "--containerd-cni-binary-dir=$cniBinDir"
-            )
-            Start-Process -FilePath "$buildkitPath\buildkitd.exe" -ArgumentList $buildkitdArgs -WindowStyle Hidden
-
-            # Wait for pipe
-            $maxAttempts = 15
-            for ($i = 1; $i -le $maxAttempts; $i++) {
-              Start-Sleep -Seconds 2
-              if (Test-Path $pipePath) {
-                Write-Host "BuildKit pipe now available after restart"
-                break
-              }
-              Write-Host "Waiting for pipe... attempt $i/$maxAttempts"
+          $maxAttempts = 15
+          for ($i = 1; $i -le $maxAttempts; $i++) {
+            if (Test-Path $pipePath) {
+              Write-Host "BuildKit pipe verified at $pipePath"
+              break
             }
-
-            if (-not (Test-Path $pipePath)) {
-              Write-Error "BuildKit pipe still not found after restart"
-              exit 1
-            }
+            Write-Host "Waiting for BuildKit pipe... attempt $i/$maxAttempts"
+            Start-Sleep -Seconds 2
           }
-          Write-Host "BuildKit pipe verified at $pipePath"
+
+          if (-not (Test-Path $pipePath)) {
+            Write-Host "Available pipes:"
+            Get-ChildItem //./pipe/ | Where-Object { $_.Name -like "*buildkit*" -or $_.Name -like "*containerd*" } | ForEach-Object { Write-Host "  $($_.Name)" }
+            Write-Error "BuildKit pipe not found at $pipePath"
+            exit 1
+          }
 
           # Create a buildx builder that uses the local buildkitd
           $buildkitAddr = "npipe:////./pipe/buildkitd"
@@ -309,8 +287,6 @@ jobs:
             Write-Error "Failed to create buildx builder"
             exit 1
           }
-
-          Write-Host "Builder created, verifying connection..."
 
           # List builders to verify
           docker buildx ls

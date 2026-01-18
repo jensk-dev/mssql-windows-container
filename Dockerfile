@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # SQL Server 2022 Developer Edition on Windows Server Core 2022
 # This image is for development and testing purposes only
 
