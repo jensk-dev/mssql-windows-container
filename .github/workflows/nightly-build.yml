@@ -24,8 +24,170 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Install containerd
+        shell: pwsh
+        run: |
+          Write-Host "Installing containerd..."
+
+          # Download and install containerd
+          $containerdVersion = "2.2.1"
+          $arch = "amd64"
+          $url = "https://github.com/containerd/containerd/releases/download/v$containerdVersion/containerd-$containerdVersion-windows-$arch.tar.gz"
+
+          Write-Host "Downloading containerd v$containerdVersion..."
+          curl.exe -fSLO $url
+          tar.exe xvf "containerd-$containerdVersion-windows-$arch.tar.gz"
+
+          # Install to Program Files
+          $containerdPath = "$env:ProgramFiles\containerd"
+          New-Item -Path $containerdPath -ItemType Directory -Force | Out-Null
+          Copy-Item -Path ".\bin\*" -Destination $containerdPath -Recurse -Force
+
+          # Add to PATH for this session
+          $env:Path = "$containerdPath;$env:Path"
+
+          # Create default config
+          & "$containerdPath\containerd.exe" config default | Out-File "$containerdPath\config.toml" -Encoding ascii
+
+          # Start containerd as a background process
+          Write-Host "Starting containerd..."
+          Start-Process -FilePath "$containerdPath\containerd.exe" -ArgumentList "--config", "$containerdPath\config.toml" -WindowStyle Hidden
+
+          # Wait for containerd to be ready
+          Start-Sleep -Seconds 5
+          Write-Host "containerd installed and started"
+
+      - name: Install BuildKit
+        shell: pwsh
+        run: |
+          Write-Host "Installing BuildKit..."
+
+          # Get latest BuildKit version
+          $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/moby/buildkit/releases/latest" -UseBasicParsing
+          $version = $releases.tag_name
+          $arch = "amd64"
+
+          Write-Host "Downloading BuildKit $version..."
+          curl.exe -fSLO "https://github.com/moby/buildkit/releases/download/$version/buildkit-$version.windows-$arch.tar.gz"
+          tar.exe xvf "buildkit-$version.windows-$arch.tar.gz"
+
+          # Install to Program Files
+          $buildkitPath = "$env:ProgramFiles\buildkit"
+          New-Item -Path $buildkitPath -ItemType Directory -Force | Out-Null
+          Copy-Item -Path ".\bin\*" -Destination $buildkitPath -Force
+
+          # Add to PATH for this session
+          $env:Path = "$buildkitPath;$env:Path"
+
+          Write-Host "BuildKit installed to $buildkitPath"
+
+      - name: Install CNI plugins
+        shell: pwsh
+        run: |
+          Write-Host "Installing CNI plugins..."
+
+          $cniVersion = "0.3.3"
+          $cniBinDir = "$env:ProgramFiles\containerd\cni\bin"
+          $cniConfDir = "$env:ProgramFiles\containerd\cni\conf"
+
+          New-Item -Path $cniBinDir -ItemType Directory -Force | Out-Null
+          New-Item -Path $cniConfDir -ItemType Directory -Force | Out-Null
+
+          # Download CNI plugins
+          $cniUrl = "https://github.com/microsoft/windows-container-networking/releases/download/v$cniVersion/windows-container-networking-cni-amd64-v$cniVersion.zip"
+          curl.exe -fSLO $cniUrl
+          tar.exe xvf "windows-container-networking-cni-amd64-v$cniVersion.zip" -C $cniBinDir
+
+          # Get NAT network info for CNI config
+          $natNetwork = Get-HnsNetwork | Where-Object { $_.Name -eq "nat" }
+          if ($natNetwork) {
+            $gateway = $natNetwork.Subnets[0].GatewayAddress
+            $subnet = $natNetwork.Subnets[0].AddressPrefix
+
+            $cniConfig = @"
+          {
+            "cniVersion": "0.2.0",
+            "name": "nat",
+            "type": "nat",
+            "master": "Ethernet",
+            "ipam": {
+              "subnet": "$subnet",
+              "routes": [
+                {
+                  "gateway": "$gateway"
+                }
+              ]
+            },
+            "capabilities": {
+              "portMappings": true,
+              "dns": true
+            }
+          }
+          "@
+            $cniConfig | Out-File "$cniConfDir\0-containerd-nat.conf" -Encoding ascii
+            Write-Host "CNI configured with subnet: $subnet, gateway: $gateway"
+          } else {
+            Write-Host "Warning: NAT network not found, CNI may not work properly"
+          }
+
+      - name: Start BuildKit daemon
+        shell: pwsh
+        run: |
+          Write-Host "Starting BuildKit daemon..."
+
+          $buildkitPath = "$env:ProgramFiles\buildkit"
+          $cniConfPath = "$env:ProgramFiles\containerd\cni\conf\0-containerd-nat.conf"
+          $cniBinDir = "$env:ProgramFiles\containerd\cni\bin"
+
+          # Start buildkitd with CNI configuration
+          $buildkitdArgs = @(
+            "--containerd-cni-config-path=$cniConfPath",
+            "--containerd-cni-binary-dir=$cniBinDir"
+          )
+
+          Start-Process -FilePath "$buildkitPath\buildkitd.exe" -ArgumentList $buildkitdArgs -WindowStyle Hidden -RedirectStandardOutput "buildkitd.log" -RedirectStandardError "buildkitd.err"
+
+          # Wait for buildkitd to be ready
+          Write-Host "Waiting for BuildKit to be ready..."
+          $maxAttempts = 30
+          $attempt = 0
+          while ($attempt -lt $maxAttempts) {
+            Start-Sleep -Seconds 2
+            $attempt++
+            try {
+              $env:Path = "$buildkitPath;$env:Path"
+              $result = & "$buildkitPath\buildctl.exe" debug info 2>&1
+              if ($LASTEXITCODE -eq 0) {
+                Write-Host "BuildKit is ready!"
+                Write-Host $result
+                break
+              }
+            } catch {
+              Write-Host "Attempt $attempt/$maxAttempts - BuildKit not ready yet..."
+            }
+          }
+
+          if ($attempt -eq $maxAttempts) {
+            Write-Host "BuildKit daemon logs:"
+            if (Test-Path "buildkitd.log") { Get-Content "buildkitd.log" }
+            if (Test-Path "buildkitd.err") { Get-Content "buildkitd.err" }
+            Write-Error "BuildKit failed to start"
+            exit 1
+          }
+
+      - name: Set up Docker Buildx with native BuildKit
+        shell: pwsh
+        run: |
+          Write-Host "Creating buildx builder with native BuildKit..."
+
+          # Create a buildx builder that uses the local buildkitd
+          # The default pipe on Windows is: npipe:////./pipe/buildkitd
+          docker buildx create --name windows-builder --driver remote npipe:////./pipe/buildkitd --use
+
+          # Verify the builder
+          docker buildx inspect --bootstrap
+
+          Write-Host "Buildx configured with native Windows BuildKit"
 
       - name: Generate build metadata
         id: meta
