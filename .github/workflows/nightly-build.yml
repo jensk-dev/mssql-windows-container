@@ -240,11 +240,63 @@ jobs:
         run: |
           Write-Host "Creating buildx builder with native BuildKit..."
 
+          # Check if buildkitd is still running
+          $buildkitdProcess = Get-Process -Name "buildkitd" -ErrorAction SilentlyContinue
+          if ($buildkitdProcess) {
+            Write-Host "buildkitd process is running (PID: $($buildkitdProcess.Id))"
+          } else {
+            Write-Host "WARNING: buildkitd process not found!"
+            Write-Host "Checking buildkitd logs..."
+            if (Test-Path "buildkitd.log") {
+              Write-Host "=== buildkitd.log ==="
+              Get-Content "buildkitd.log"
+            }
+            if (Test-Path "buildkitd.err") {
+              Write-Host "=== buildkitd.err ==="
+              Get-Content "buildkitd.err"
+            }
+          }
+
+          # List all named pipes to debug
+          Write-Host "Listing buildkit-related pipes..."
+          Get-ChildItem //./pipe/ | Where-Object { $_.Name -like "*buildkit*" -or $_.Name -like "*containerd*" } | ForEach-Object { Write-Host "  Pipe: $($_.Name)" }
+
           # Verify buildkitd pipe is accessible
           $pipePath = "\\.\pipe\buildkitd"
           if (-not (Test-Path $pipePath)) {
-            Write-Error "BuildKit pipe not found at $pipePath"
-            exit 1
+            Write-Host "BuildKit pipe not found at $pipePath"
+            Write-Host "Attempting to restart buildkitd..."
+
+            $buildkitPath = "$env:ProgramFiles\buildkit"
+            $cniConfPath = "$env:ProgramFiles\containerd\cni\conf\0-containerd-nat.conf"
+            $cniBinDir = "$env:ProgramFiles\containerd\cni\bin"
+
+            # Kill any existing buildkitd
+            Stop-Process -Name "buildkitd" -Force -ErrorAction SilentlyContinue
+
+            # Restart buildkitd
+            $buildkitdArgs = @(
+              "--addr", "npipe:////./pipe/buildkitd",
+              "--containerd-cni-config-path=$cniConfPath",
+              "--containerd-cni-binary-dir=$cniBinDir"
+            )
+            Start-Process -FilePath "$buildkitPath\buildkitd.exe" -ArgumentList $buildkitdArgs -WindowStyle Hidden
+
+            # Wait for pipe
+            $maxAttempts = 15
+            for ($i = 1; $i -le $maxAttempts; $i++) {
+              Start-Sleep -Seconds 2
+              if (Test-Path $pipePath) {
+                Write-Host "BuildKit pipe now available after restart"
+                break
+              }
+              Write-Host "Waiting for pipe... attempt $i/$maxAttempts"
+            }
+
+            if (-not (Test-Path $pipePath)) {
+              Write-Error "BuildKit pipe still not found after restart"
+              exit 1
+            }
           }
           Write-Host "BuildKit pipe verified at $pipePath"
 
