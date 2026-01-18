@@ -161,31 +161,39 @@ jobs:
           $cniConfPath = "$env:ProgramFiles\containerd\cni\conf\0-containerd-nat.conf"
           $cniBinDir = "$env:ProgramFiles\containerd\cni\bin"
 
-          # Start buildkitd with CNI configuration
+          # Start buildkitd with CNI configuration and explicit address
           $buildkitdArgs = @(
+            "--addr", "npipe:////./pipe/buildkitd",
             "--containerd-cni-config-path=$cniConfPath",
             "--containerd-cni-binary-dir=$cniBinDir"
           )
 
+          Write-Host "Starting buildkitd with args: $($buildkitdArgs -join ' ')"
           Start-Process -FilePath "$buildkitPath\buildkitd.exe" -ArgumentList $buildkitdArgs -WindowStyle Hidden -RedirectStandardOutput "buildkitd.log" -RedirectStandardError "buildkitd.err"
 
           # Wait for buildkitd to be ready
           Write-Host "Waiting for BuildKit to be ready..."
+          $pipePath = "\\.\pipe\buildkitd"
           $maxAttempts = 30
           $attempt = 0
           while ($attempt -lt $maxAttempts) {
             Start-Sleep -Seconds 2
             $attempt++
-            try {
+
+            # Check if pipe exists
+            $pipeExists = Test-Path $pipePath
+            Write-Host "Attempt $attempt/$maxAttempts - Pipe exists: $pipeExists"
+
+            if ($pipeExists) {
               $env:Path = "$buildkitPath;$env:Path"
-              $result = & "$buildkitPath\buildctl.exe" debug info 2>&1
+              $result = & "$buildkitPath\buildctl.exe" --addr "npipe:////./pipe/buildkitd" debug info 2>&1
               if ($LASTEXITCODE -eq 0) {
                 Write-Host "BuildKit is ready!"
                 Write-Host $result
                 break
+              } else {
+                Write-Host "buildctl returned error: $result"
               }
-            } catch {
-              Write-Host "Attempt $attempt/$maxAttempts - BuildKit not ready yet..."
             }
           }
 
@@ -196,6 +204,8 @@ jobs:
             Write-Error "BuildKit failed to start"
             exit 1
           }
+
+          Write-Host "BuildKit daemon started successfully on npipe:////./pipe/buildkitd"
 
       - name: Install Docker Buildx plugin
         shell: pwsh
@@ -230,12 +240,28 @@ jobs:
         run: |
           Write-Host "Creating buildx builder with native BuildKit..."
 
-          # Create a buildx builder that uses the local buildkitd
-          # The default pipe on Windows is: npipe:////./pipe/buildkitd
-          docker buildx create --name windows-builder --driver remote npipe:////./pipe/buildkitd --use
+          # Verify buildkitd pipe is accessible
+          $pipePath = "\\.\pipe\buildkitd"
+          if (-not (Test-Path $pipePath)) {
+            Write-Error "BuildKit pipe not found at $pipePath"
+            exit 1
+          }
+          Write-Host "BuildKit pipe verified at $pipePath"
 
-          # Verify the builder
-          docker buildx inspect --bootstrap
+          # Create a buildx builder that uses the local buildkitd
+          $buildkitAddr = "npipe:////./pipe/buildkitd"
+          Write-Host "Creating buildx builder with address: $buildkitAddr"
+
+          docker buildx create --name windows-builder --driver remote $buildkitAddr --use
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to create buildx builder"
+            exit 1
+          }
+
+          Write-Host "Builder created, verifying connection..."
+
+          # List builders to verify
+          docker buildx ls
 
           Write-Host "Buildx configured with native Windows BuildKit"
 
