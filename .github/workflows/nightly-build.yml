@@ -24,6 +24,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Generate build metadata
         id: meta
         shell: pwsh
@@ -131,62 +134,48 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Docker image
+      - name: Build and Push Docker image
         if: steps.tag_check.outputs.skip_build != 'true'
         shell: pwsh
+        env:
+          DOCKER_BUILDKIT: 1
         run: |
-          Write-Host "Building Docker image..."
+          Write-Host "Building and pushing Docker image with zstd compression..."
 
-          $tags = @"
-          ${{ steps.meta.outputs.tags }}
-          "@
+          $tags = "${{ steps.meta.outputs.tags }}" -split "`n" | Where-Object { $_.Trim() }
+          $tagArgs = ($tags | ForEach-Object { "--tag", $_.Trim() }) -join " "
 
-          # Build with first tag
-          $primaryTag = ($tags -split "`n" | Select-Object -First 1).Trim()
-          Write-Host "Primary tag: $primaryTag"
+          Write-Host "Tags to be applied:"
+          $tags | ForEach-Object { Write-Host "  - $($_.Trim())" }
 
-          docker build -t $primaryTag .
+          $buildCmd = @(
+            "docker", "buildx", "build",
+            "--output", "type=image,oci-mediatypes=true,compression=zstd,compression-level=3,push=true",
+            "--cache-from", "type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache",
+            "--cache-to", "type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max"
+          )
+
+          # Add tags
+          foreach ($tag in $tags) {
+            $trimmedTag = $tag.Trim()
+            if ($trimmedTag) {
+              $buildCmd += "--tag"
+              $buildCmd += $trimmedTag
+            }
+          }
+
+          # Add context
+          $buildCmd += "."
+
+          Write-Host "Executing: $($buildCmd -join ' ')"
+          & $buildCmd[0] $buildCmd[1..($buildCmd.Length - 1)]
 
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "Docker build failed"
+            Write-Error "Docker buildx build failed"
             exit 1
           }
 
-          # Apply additional tags
-          $tags -split "`n" | Select-Object -Skip 1 | ForEach-Object {
-            $tag = $_.Trim()
-            if ($tag) {
-              Write-Host "Applying additional tag: $tag"
-              docker tag $primaryTag $tag
-            }
-          }
-
-          Write-Host "Docker build completed successfully"
-
-      - name: Push Docker image
-        if: steps.tag_check.outputs.skip_build != 'true'
-        shell: pwsh
-        run: |
-          Write-Host "Pushing Docker images to registry..."
-
-          $tags = @"
-          ${{ steps.meta.outputs.tags }}
-          "@
-
-          $tags -split "`n" | ForEach-Object {
-            $tag = $_.Trim()
-            if ($tag) {
-              Write-Host "Pushing: $tag"
-              docker push $tag
-
-              if ($LASTEXITCODE -ne 0) {
-                Write-Error "Failed to push: $tag"
-                exit 1
-              }
-            }
-          }
-
-          Write-Host "All images pushed successfully"
+          Write-Host "Docker build and push completed successfully"
 
       - name: Create checksum tag
         if: steps.tag_check.outputs.skip_build != 'true'

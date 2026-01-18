@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # SQL Server 2022 Developer Edition on Windows Server Core 2022
 # This image is for development and testing purposes only
 
@@ -7,6 +8,7 @@ LABEL maintainer="automated-build"
 LABEL description="SQL Server 2022 Developer Edition on Windows Server Core 2022"
 LABEL sql_version="2022"
 LABEL base_os="Windows Server Core LTSC 2025"
+LABEL org.opencontainers.image.source="https://github.com/jensk-dev/mssql-windows-container"
 
 SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
 
